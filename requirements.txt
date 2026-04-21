@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+paramiko
+scp
+python-dotenv
+boto3
