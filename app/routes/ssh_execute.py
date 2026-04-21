@@ -1,4 +1,6 @@
 import re
+import socket
+from paramiko.ssh_exception import AuthenticationException, NoValidConnectionsError, SSHException
 from fastapi import APIRouter, HTTPException
 from app.models.request_models import SSHCommandRequest
 from app.services.ssh_service import create_ssh_client, execute_command
@@ -35,11 +37,21 @@ def get_installed_version(data: SSHCommandRequest):
     try:
         ssh = create_ssh_client(data.ip, data.username, data.password)
         try:
-            # First try plain command; if PATH is missing in non-interactive shell,
-            # retry through a login shell.
-            result = execute_command(ssh, "ts_about")
-            if not result.get("output", "").strip():
-                result = execute_command(ssh, "bash -lc 'ts_about'")
+            # Try direct and login-shell variants because non-interactive SSH
+            # sessions may not have the MX-ONE binary in PATH.
+            attempts = [
+                "ts_about",
+                "bash -lc 'ts_about'",
+                "sh -lc 'ts_about'",
+            ]
+            result = {"output": "", "error": "", "exit_status": None}
+            for command in attempts:
+                candidate = execute_command(ssh, command)
+                has_output = bool(candidate.get("output", "").strip())
+                exit_ok = candidate.get("exit_status") == 0
+                result = candidate
+                if has_output or exit_ok:
+                    break
         finally:
             ssh.close()
 
@@ -54,6 +66,12 @@ def get_installed_version(data: SSHCommandRequest):
                 detail=f"ts_about failed: {error_text.strip()}",
             )
 
+        if not output_text.strip() and not error_text.strip():
+            raise HTTPException(
+                status_code=500,
+                detail="ts_about returned no output. Verify PATH/permissions on target host.",
+            )
+
         return {
             "status": "success",
             "MX-One Server": data.ip,
@@ -65,5 +83,17 @@ def get_installed_version(data: SSHCommandRequest):
 
     except HTTPException:
         raise
+    except AuthenticationException:
+        raise HTTPException(status_code=401, detail="SSH authentication failed.")
+    except (NoValidConnectionsError, socket.timeout, TimeoutError):
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Unable to reach target VM via SSH from this API server. "
+                "If calling hosted Render endpoint, private/local IPs are not reachable."
+            ),
+        )
+    except SSHException as e:
+        raise HTTPException(status_code=500, detail=f"SSH error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
