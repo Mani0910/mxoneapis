@@ -17,8 +17,10 @@ def create_ssh_client(ip, username, password):
 
 def execute_command(ssh, command: str):
     stdin, stdout, stderr = ssh.exec_command(command)
+    exit_status = stdout.channel.recv_exit_status()
 
     return {
-        "output": stdout.read().decode()
-        
+        "output": stdout.read().decode(errors="ignore"),
+        "error": stderr.read().decode(errors="ignore"),
+        "exit_status": exit_status,
     }

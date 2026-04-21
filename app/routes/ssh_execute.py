@@ -34,18 +34,36 @@ def get_installed_version(data: SSHCommandRequest):
     """
     try:
         ssh = create_ssh_client(data.ip, data.username, data.password)
-        result = execute_command(ssh, "ts_about")
-        ssh.close()
+        try:
+            # First try plain command; if PATH is missing in non-interactive shell,
+            # retry through a login shell.
+            result = execute_command(ssh, "ts_about")
+            if not result.get("output", "").strip():
+                result = execute_command(ssh, "bash -lc 'ts_about'")
+        finally:
+            ssh.close()
 
-        output_lines = result["output"].splitlines()
-        version = _parse_version_from_ts_about(result["output"])
+        output_text = result.get("output", "")
+        error_text = result.get("error", "")
+        output_lines = output_text.splitlines()
+        version = _parse_version_from_ts_about(output_text)
+
+        if not output_text.strip() and error_text.strip():
+            raise HTTPException(
+                status_code=500,
+                detail=f"ts_about failed: {error_text.strip()}",
+            )
 
         return {
             "status": "success",
             "MX-One Server": data.ip,
             "installed_version": version,
             "output": output_lines,
+            "error": error_text.splitlines(),
+            "exit_status": result.get("exit_status"),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
