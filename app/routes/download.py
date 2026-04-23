@@ -14,31 +14,11 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _run_download(data: DownloadRequest):
+def _run_download(data: DownloadRequest, bin_url: str, bin_file: str):
     target = data.ip
     ssh = None
+    dest = f"{MXONE_REMOTE_DIR}/{bin_file}"
     try:
-        update_progress(target, {
-            "task": "download",
-            "current_step": "resolve",
-            "state": "connecting",
-            "progress": 0,
-            "message": f"Resolving build URL for '{data.build_name}'",
-            "in_progress": 1,
-        })
-
-        bin_url, bin_file = get_build_bin_url(data.build_name)
-        if not bin_url:
-            update_progress(target, {
-                "task": "download",
-                "current_step": "error",
-                "state": "error",
-                "progress": 0,
-                "message": f"No .bin file found for build: {data.build_name}",
-                "in_progress": 0,
-            })
-            return
-
         update_progress(target, {
             "task": "download",
             "current_step": "connect",
@@ -49,7 +29,6 @@ def _run_download(data: DownloadRequest):
         })
 
         ssh = create_ssh_client(data.ip, data.username, data.password)
-        dest = f"{MXONE_REMOTE_DIR}/{bin_file}"
 
         update_progress(target, {
             "task": "download",
@@ -147,12 +126,42 @@ def _run_download(data: DownloadRequest):
 def download_build(data: DownloadRequest):
     """
     Download a MX-ONE build directly onto the target VM via SSH wget.
+    Skips the download if the file already exists on the VM.
 
     Typical flow:
     1. GET /builds/list  — pick a build tag (e.g. mx7.6.sp1.hf0.rc19)
     2. POST /builds/download  — pass that tag as build_name
     3. GET /status/download?ip=<ip>  — poll until state == completed
     """
+    # Resolve the .bin filename first (without SSH) so we can check existence
+    try:
+        bin_url, bin_file = get_build_bin_url(data.build_name)
+    except Exception as e:
+        return {"status": "error", "message": f"Could not resolve build URL: {e}"}
+
+    if not bin_url:
+        return {"status": "error", "message": f"No .bin file found for build: {data.build_name}"}
+
+    dest = f"{MXONE_REMOTE_DIR}/{bin_file}"
+
+    # Check if the file already exists on the VM
+    try:
+        ssh = create_ssh_client(data.ip, data.username, data.password)
+        try:
+            stdin, stdout, _ = ssh.exec_command(f"test -f {dest} && echo EXISTS || echo MISSING")
+            result = stdout.read().decode().strip()
+        finally:
+            ssh.close()
+
+        if result == "EXISTS":
+            return {
+                "status": "already_exists",
+                "message": f"{bin_file} already exists on {data.ip} at {dest}. Skipping download.",
+                "destination": dest,
+            }
+    except Exception as e:
+        return {"status": "error", "message": f"Could not connect to {data.ip}: {e}"}
+
     started, current = begin_operation(
         data.ip,
         "download",
@@ -165,7 +174,7 @@ def download_build(data: DownloadRequest):
             "current": current,
         }
 
-    thread = threading.Thread(target=_run_download, args=(data,), daemon=True)
+    thread = threading.Thread(target=_run_download, args=(data, bin_url, bin_file), daemon=True)
     thread.start()
 
     return {
