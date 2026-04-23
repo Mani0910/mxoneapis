@@ -1,0 +1,23 @@
+services:
+  mxone-api:
+    image: ghcr.io/mani0910/mxoneapis:latest
+    container_name: mxone-api
+    ports:
+      - "8000:8000"
+    environment:
+      - BASE_URL=${BASE_URL:-http://10.105.64.17/GIT/Release/refs/tags/}
+      - MXONE_REMOTE_DIR=${MXONE_REMOTE_DIR:-/local/home/mxone_admin}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ~/.ssh:/home/appuser/.ssh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    driver: bridge

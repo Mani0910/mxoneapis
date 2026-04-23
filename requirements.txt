@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 paramiko
-scp
+beautifulsoup4
+requests
 python-dotenv
-boto3

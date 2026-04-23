@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from app.models.request_models import TransferRequest
 from app.services.ssh_service import create_ssh_client
-from app.services.progress_store import progress_data
+from app.services.progress_store import begin_operation, update_progress
 from app.config import BUILD_PATH, MXONE_REMOTE_DIR
 from scp import SCPClient
 import os
@@ -18,7 +18,19 @@ def transfer_build(data: TransferRequest):
     if not os.path.isfile(local_path):
         raise HTTPException(404, "Build not found")
 
-    progress_data.update({
+    started, current = begin_operation(
+        data.ip,
+        "transfer",
+        f"Starting transfer to {data.ip}",
+    )
+    if not started:
+        return {
+            "status": "busy",
+            "message": f"Another operation is already in progress on {data.ip}.",
+            "current": current,
+        }
+
+    update_progress(data.ip, {
         "task": "transfer",
         "current_step": "connect",
         "state": "connecting",
@@ -38,7 +50,7 @@ def transfer_build(data: TransferRequest):
             ssh.exec_command(f"mkdir -p {MXONE_REMOTE_DIR}")
             print("[TRANSFER] Upload started", flush=True)
 
-            progress_data.update({
+            update_progress(data.ip, {
                 "task": "transfer",
                 "current_step": "upload",
                 "state": "uploading",
@@ -50,8 +62,10 @@ def transfer_build(data: TransferRequest):
             def progress(filename, size, sent):
                 nonlocal last_pct
                 pct = int((sent / size) * 100) if size else 0
-                progress_data["progress"] = pct
-                progress_data["message"] = f"Uploading {data.build_name}"
+                update_progress(data.ip, {
+                    "progress": pct,
+                    "message": f"Uploading {data.build_name}",
+                })
                 if pct % 10 == 0 and pct != last_pct:
                     last_pct = pct
                     print(f"[TRANSFER] {data.build_name}: {pct}%", flush=True)
@@ -59,7 +73,7 @@ def transfer_build(data: TransferRequest):
             scp = SCPClient(ssh.get_transport(), progress=progress)
             scp.put(local_path, f"{MXONE_REMOTE_DIR}/{data.build_name}")
 
-            progress_data.update({
+            update_progress(data.ip, {
                 "task": "transfer",
                 "current_step": "done",
                 "state": "completed",
@@ -70,7 +84,7 @@ def transfer_build(data: TransferRequest):
             print("[TRANSFER] Completed", flush=True)
 
         except Exception as e:
-            progress_data.update({
+            update_progress(data.ip, {
                 "task": "transfer",
                 "current_step": "error",
                 "state": "error",
@@ -96,6 +110,12 @@ def transfer_build(data: TransferRequest):
 
     return {
         "status": "started",
-        "message": f"Transfer of {data.build_name} to {data.ip} has started"
-        
+        "message": f"Transfer of {data.build_name} to {data.ip} has started",
+        "poll": f"GET /status?ip={data.ip}",
     }
+
+
+@router.post("/transfer_MXONE")
+def transfer_build_legacy(data: TransferRequest):
+    # Backward-compatible alias used by older clients/Postman collections.
+    return transfer_build(data)

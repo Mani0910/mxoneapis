@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from app.models.request_models import UpgradeRequest
 from app.services.upgrade_service import run_full_upgrade
-from app.services.progress_store import progress_data
 import logging
 
 router = APIRouter()
@@ -26,17 +25,18 @@ def upgrade_all(data: UpgradeRequest):
         Use POST /builds/download first if it is not.
       - version format: "7.6.1.0.19"  (major.minor.sp.hf.rc)
     """
-    if progress_data.get("in_progress") == 1:
-        return {
-            "status": "busy",
-            "message": "Another operation is already in progress.",
-            "current": progress_data.copy(),
-        }
+    if not data.host:
+        raise HTTPException(status_code=422, detail="Provide 'host' or 'ip' field.")
+    if not data.version:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide 'version' (e.g. 7.8.0.0.23) or 'build_name' (e.g. MX-ONE_7.8.sp0.hf0.rc23.bin).",
+        )
 
     try:
         logger.info(f"Received upgrade request for host: {data.host}, version: {data.version}")
         result = run_full_upgrade(data)
-        return {"status": "success", "data": result}
+        return result
 
     except Exception as e:
         logger.error(f"Upgrade failed: {str(e)}", exc_info=True)

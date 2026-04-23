@@ -1,12 +1,13 @@
+import re
 import threading
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 from app.models.request_models import DownloadRequest
 from app.services.ssh_service import create_ssh_client
-from app.services.s3_service import generate_presigned_url
-from app.services.progress_store import progress_data
+from app.services.build_service import get_build_bin_url
+from app.services.progress_store import begin_operation, update_progress
 from app.config import MXONE_REMOTE_DIR
 
 router = APIRouter()
@@ -14,68 +15,118 @@ logger = logging.getLogger(__name__)
 
 
 def _run_download(data: DownloadRequest):
+    target = data.ip
     ssh = None
     try:
-        progress_data.update({
+        update_progress(target, {
+            "task": "download",
+            "current_step": "resolve",
+            "state": "connecting",
+            "progress": 0,
+            "message": f"Resolving build URL for '{data.build_name}'",
+            "in_progress": 1,
+        })
+
+        bin_url, bin_file = get_build_bin_url(data.build_name)
+        if not bin_url:
+            update_progress(target, {
+                "task": "download",
+                "current_step": "error",
+                "state": "error",
+                "progress": 0,
+                "message": f"No .bin file found for build: {data.build_name}",
+                "in_progress": 0,
+            })
+            return
+
+        update_progress(target, {
             "task": "download",
             "current_step": "connect",
             "state": "connecting",
-            "progress": 0,
+            "progress": 2,
             "message": f"Connecting to {data.ip}",
             "in_progress": 1,
         })
 
         ssh = create_ssh_client(data.ip, data.username, data.password)
-        ssh.exec_command(f"mkdir -p {MXONE_REMOTE_DIR}")
+        dest = f"{MXONE_REMOTE_DIR}/{bin_file}"
 
-        progress_data.update({
-            "task": "download",
-            "current_step": "generate_url",
-            "state": "in_progress",
-            "progress": 5,
-            "message": "Generating secure download URL from S3",
-            "in_progress": 1,
-        })
-
-        # Presigned URL valid for 2 hours — plenty of time for large .bin files
-        url = generate_presigned_url(data.build_name, expiry_seconds=7200)
-        dest = f"{MXONE_REMOTE_DIR}/{data.build_name}"
-
-        progress_data.update({
+        update_progress(target, {
             "task": "download",
             "current_step": "downloading",
             "state": "in_progress",
-            "progress": 10,
-            "message": f"Downloading {data.build_name} on {data.ip} (this may take several minutes)",
+            "progress": 5,
+            "message": f"Starting wget download of {bin_file} on {data.ip}",
+            "destination": dest,
             "in_progress": 1,
         })
 
-        logger.info(f"[DOWNLOAD] Starting wget on {data.ip} → {dest}")
+        command = (
+            f"mkdir -p {MXONE_REMOTE_DIR} && "
+            f"wget --progress=bar:force:noscroll -O {dest} {bin_url} 2>&1"
+        )
 
-        # Run wget on the remote VM; -q silences progress bar noise in logs
-        # timeout=7200 (2h) matches the presigned URL expiry
-        wget_cmd = f'wget -q -O "{dest}" "{url}"'
-        _, stdout, stderr = ssh.exec_command(wget_cmd, timeout=7200)
-        exit_code = stdout.channel.recv_exit_status()
+        channel = ssh.get_transport().open_session()
+        channel.set_combine_stderr(True)
+        channel.exec_command(command)
 
-        if exit_code != 0:
-            err_output = stderr.read().decode(errors="ignore").strip()
-            raise Exception(f"wget exited with code {exit_code}: {err_output}")
+        while not channel.exit_status_ready():
+            if channel.recv_ready():
+                chunk = channel.recv(4096).decode("utf-8", errors="ignore")
+                matches = re.findall(r"(\d+)%", chunk)
+                if matches:
+                    pct = int(matches[-1])
+                    update_progress(target, {
+                        "task": "download",
+                        "current_step": "downloading",
+                        "state": "in_progress",
+                        "progress": pct,
+                        "message": f"Downloading {bin_file}: {pct}%",
+                        "destination": dest,
+                        "in_progress": 1,
+                    })
 
-        logger.info(f"[DOWNLOAD] Completed: {data.build_name} on {data.ip}")
+        # Drain any remaining output
+        while channel.recv_ready():
+            chunk = channel.recv(4096).decode("utf-8", errors="ignore")
+            matches = re.findall(r"(\d+)%", chunk)
+            if matches:
+                pct = int(matches[-1])
+                update_progress(target, {
+                    "task": "download",
+                    "current_step": "downloading",
+                    "state": "in_progress",
+                    "progress": pct,
+                    "message": f"Downloading {bin_file}: {pct}%",
+                    "destination": dest,
+                    "in_progress": 1,
+                })
 
-        progress_data.update({
-            "task": "download",
-            "current_step": "done",
-            "state": "completed",
-            "progress": 100,
-            "message": f"Download complete: {data.build_name} is ready at {dest}",
-            "in_progress": 0,
-        })
+        exit_code = channel.recv_exit_status()
+
+        if exit_code == 0:
+            update_progress(target, {
+                "task": "download",
+                "current_step": "done",
+                "state": "completed",
+                "progress": 100,
+                "message": f"Download complete: {bin_file} is ready at {dest}",
+                "destination": dest,
+                "in_progress": 0,
+            })
+        else:
+            update_progress(target, {
+                "task": "download",
+                "current_step": "error",
+                "state": "error",
+                "progress": 0,
+                "message": "wget exited with a non-zero status code",
+                "in_progress": 0,
+            })
 
     except Exception as e:
-        logger.error(f"[DOWNLOAD] Failed: {e}")
-        progress_data.update({
+        logger.error(f"[DOWNLOAD] Failed on {target}: {e}")
+        update_progress(target, {
             "task": "download",
             "current_step": "error",
             "state": "error",
@@ -93,29 +144,32 @@ def _run_download(data: DownloadRequest):
 
 
 @router.post("/builds/download")
-def download_build_to_vm(data: DownloadRequest):
+def download_build(data: DownloadRequest):
     """
-    Download a build from S3 directly onto the target VM using wget over SSH.
+    Download a MX-ONE build directly onto the target VM via SSH wget.
 
-    Steps:
-      1. SSH into the VM
-      2. Generate a short-lived presigned S3 URL
-      3. Run wget on the VM to pull the file into /local/home/mxone_admin/ (default)
-
-    Poll GET /status to track progress.
-    Once state == 'completed', you can call POST /mxone/upgrade/all to start the upgrade.
+    Typical flow:
+    1. GET /builds/list  — pick a build tag (e.g. mx7.6.sp1.hf0.rc19)
+    2. POST /builds/download  — pass that tag as build_name
+    3. GET /status/download?ip=<ip>  — poll until state == completed
     """
-    if progress_data.get("in_progress") == 1:
+    started, current = begin_operation(
+        data.ip,
+        "download",
+        f"Starting download on {data.ip}",
+    )
+    if not started:
         return {
             "status": "busy",
-            "message": "Another operation is already in progress.",
-            "current": progress_data.copy(),
+            "message": f"Another operation is already in progress on {data.ip}.",
+            "current": current,
         }
 
-    threading.Thread(target=_run_download, args=(data,), daemon=True).start()
+    thread = threading.Thread(target=_run_download, args=(data,), daemon=True)
+    thread.start()
 
     return {
         "status": "started",
-        "message": f"Download of {data.build_name} to {data.ip}:{MXONE_REMOTE_DIR} has started.",
-        "poll": "GET /status",
+        "message": f"Download started for '{data.build_name}' on {data.ip}",
+        "poll": f"GET /status/download?ip={data.ip}",
     }

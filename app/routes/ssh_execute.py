@@ -27,7 +27,7 @@ def _parse_version_from_ts_about(output: str) -> str | None:
     return None
 
 
-@router.post("/ssh/installed")
+@router.post("/mxone/installed")
 def get_installed_version(data: SSHCommandRequest):
     """
     Connect to a VM via SSH, run ts_about, and return the installed MX-ONE version.

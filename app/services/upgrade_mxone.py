@@ -108,6 +108,82 @@ class SystemUpgradeManager:
         return False
 
     # -------------------------
+    # VERSION CHECK
+    # -------------------------
+    def check_mxone_version(self):
+        """Run ts_about and return the installed version string, e.g. '7.8.0.0.23'."""
+        self._ensure_connected()
+        stdin, stdout, stderr = self.ssh_client.exec_command('ts_about')
+        text = stdout.read().decode('utf-8', errors='ignore')
+        match = re.search(r"Version:\s+([\d\.]+)", text)
+        if match:
+            version = match.group(1)
+            logging.info(f"Current installed MX-ONE version: {version}")
+            return version
+        # fallback: try with login shell
+        _, stdout2, _ = self.ssh_client.exec_command("bash -lc 'ts_about'")
+        text2 = stdout2.read().decode('utf-8', errors='ignore')
+        match2 = re.search(r"Version:\s+([\d\.]+)", text2)
+        if match2:
+            return match2.group(1)
+        logging.warning("Could not determine installed MX-ONE version")
+        return None
+
+    # -------------------------
+    # OLDER VERSION CLEANUP
+    # -------------------------
+    def get_older_versions(self):
+        """Return list of older installed MX-ONE package versions."""
+        self._ensure_connected()
+        shell = self.ssh_client.invoke_shell()
+        shell.send('su -l root\n')
+        time.sleep(1)
+        shell.send(self.sudo_password + '\n')
+        time.sleep(2)
+        shell.send('/opt/mxone_install/bin/package_handling --list\n')
+        time.sleep(2)
+        data = b""
+        if shell.recv_ready():
+            data = shell.recv(4096)
+        shell.close()
+        console_data = data.decode('utf-8', errors='ignore')
+
+        pattern = r"Older version\(s\):([\s\S]*?)\nNewer version\(s\):"
+        match = re.search(pattern, console_data)
+        if not match:
+            logging.info("No older versions found.")
+            return []
+        section = match.group(1)
+        versions = re.findall(r"\(([\d\.]+)\)", section)
+        logging.info(f"Older MX-ONE package versions: {versions}")
+        return versions
+
+    def delete_older_versions(self, version_list):
+        """Delete older installed MX-ONE package folders from all install directories."""
+        if not version_list:
+            logging.info("No older versions to delete.")
+            return
+        self._ensure_connected()
+        shell = self.ssh_client.invoke_shell()
+        shell.send('su -l root\n')
+        time.sleep(1)
+        shell.send(self.sudo_password + '\n')
+        time.sleep(2)
+        base_dirs = [
+            '/opt/mxone_install/',
+            '/opt/mxone_snm_install/',
+            '/opt/mxone_pm_install/',
+        ]
+        for ver in version_list:
+            for base in base_dirs:
+                cmd = f"rm -rf {base}{ver}\n"
+                shell.send(cmd)
+                logging.info(f"Deleting: {base}{ver}")
+                time.sleep(1)
+        shell.send('exit\n')
+        logging.info("Older version cleanup completed.")
+
+    # -------------------------
     # DISTRIBUTE
     # -------------------------
     def distribute_builds(self, distribute_command):
