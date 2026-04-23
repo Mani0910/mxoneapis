@@ -1,6 +1,9 @@
 services:
   mxone-api:
     image: ghcr.io/mani0910/mxoneapis:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: mxone-api
     ports:
       - "8000:8000"
