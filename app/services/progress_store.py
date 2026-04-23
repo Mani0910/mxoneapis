@@ -1,119 +1,107 @@
 import threading
-import threading
 import time
 from copy import deepcopy
 
 
 _lock = threading.Lock()
-_last_target = ""
-_STATUS_TTL_SECONDS = 60
+_STATUS_TTL_SECONDS = 300  # keep completed/error status for 5 minutes
+
+# Key: (ip, task)  e.g. ("10.1.1.1", "download") or ("10.1.1.1", "upgrade")
+_store: dict = {}
 
 
-def _default_progress():
+def _default_progress(ip: str = "", task: str = ""):
     return {
-        "task": "",            # transfer | download | upgrade
-        "current_step": "",    # current logical step name
-        "state": "idle",       # idle | connecting | in_progress | rebooting | completed | error
-        "progress": 0,           # 0-100 percent
-        "message": "",          # human-readable status
-        "in_progress": 0,        # 1 while operation is running
+        "task": task,
+        "current_step": "",
+        "state": "idle",
+        "progress": 0,
+        "message": "",
+        "in_progress": 0,
+        "target": ip,
     }
 
 
+def _normalize(ip: str) -> str:
+    return (ip or "").strip()
+
+
 def _purge_expired_locked():
-    global _last_target
-
     now = time.time()
-    expired_targets = []
-    for target, status in _progress_by_target.items():
-        completed_at = status.get("completed_at")
-        if completed_at and now - completed_at >= _STATUS_TTL_SECONDS:
-            expired_targets.append(target)
-
-    for target in expired_targets:
-        _progress_by_target.pop(target, None)
-        if _last_target == target:
-            _last_target = ""
+    expired = [k for k, v in _store.items()
+               if v.get("completed_at") and now - v["completed_at"] >= _STATUS_TTL_SECONDS]
+    for k in expired:
+        del _store[k]
 
 
-_progress_by_target = {}
-
-
-def _normalize_target(target: str) -> str:
-    return (target or "").strip()
-
-
-def begin_operation(target: str, task: str, message: str = ""):
+def begin_operation(ip: str, task: str, message: str = ""):
     """
-    Atomically start an operation on one target.
+    Atomically claim a (ip, task) slot.
     Returns (started: bool, current_state: dict).
+    Two different tasks on the same IP are allowed in parallel.
     """
-    global _last_target
-
-    key = _normalize_target(target)
-    if not key:
-        key = "unknown"
+    key = (_normalize(ip), task)
+    target = key[0] or "unknown"
 
     with _lock:
         _purge_expired_locked()
-        current = _progress_by_target.get(key)
+        current = _store.get(key)
         if current and current.get("in_progress") == 1:
             return False, deepcopy(current)
 
-        payload = _default_progress()
+        payload = _default_progress(target, task)
         payload.update({
-            "task": task,
             "state": "in_progress",
-            "progress": 0,
             "message": message,
             "current_step": "start",
             "in_progress": 1,
-            "target": key,
         })
-        _progress_by_target[key] = payload
-        _last_target = key
+        _store[key] = payload
         return True, deepcopy(payload)
 
 
-def update_progress(target: str, patch: dict):
-    global _last_target
-
-    key = _normalize_target(target)
-    if not key:
-        key = "unknown"
+def update_progress(ip: str, patch: dict):
+    """Update progress for a specific (ip, task) slot. task must be in the patch dict."""
+    task = patch.get("task", "")
+    key = (_normalize(ip) or "unknown", task)
 
     with _lock:
         _purge_expired_locked()
-        current = _progress_by_target.get(key)
+        current = _store.get(key)
         if not current:
-            current = _default_progress()
-            current["target"] = key
-            _progress_by_target[key] = current
+            current = _default_progress(key[0], task)
+            _store[key] = current
 
         current.update(patch)
-        current["target"] = key
+        current["target"] = key[0]
         if current.get("state") in {"completed", "error"} and current.get("in_progress") == 0:
             current["completed_at"] = time.time()
         else:
             current.pop("completed_at", None)
-        _last_target = key
         return deepcopy(current)
 
 
-def get_progress(target: str = ""):
-    key = _normalize_target(target)
+def get_progress(ip: str, task: str):
+    """Get current status for a specific ip + task."""
+    key = (_normalize(ip) or "unknown", task)
     with _lock:
         _purge_expired_locked()
-        if key:
-            return deepcopy(_progress_by_target.get(key, _default_progress()))
-
-        if _last_target and _last_target in _progress_by_target:
-            return deepcopy(_progress_by_target[_last_target])
-
-        return deepcopy(_default_progress())
+        return deepcopy(_store.get(key, _default_progress(ip, task)))
 
 
-def get_all_progress():
+def get_all_progress_by_task(task: str) -> dict:
+    """Return {ip: status} for all IPs that have a record for this task."""
     with _lock:
         _purge_expired_locked()
-        return deepcopy(_progress_by_target)
+        return {
+            ip: deepcopy(v)
+            for (ip, t), v in _store.items()
+            if t == task
+        }
+
+
+def get_all_progress() -> dict:
+    """Return everything keyed as 'ip::task'."""
+    with _lock:
+        _purge_expired_locked()
+        return {f"{ip}::{task}": deepcopy(v) for (ip, task), v in _store.items()}
