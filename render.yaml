@@ -1,22 +1,10 @@
 services:
   - type: web
     name: mxone-api
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.11
+      - key: BASE_URL
+        value: http://10.105.64.17/GIT/Release/refs/tags/
       - key: MXONE_REMOTE_DIR
         value: /local/home/mxone_admin
-      - key: BUILD_PATH
-        value: /local/home/mxone_admin
-      - key: AWS_S3_BUCKET
-        value: mxonebuilds
-      - key: AWS_REGION
-        value: eu-north-1
-      - key: AWS_ACCESS_KEY_ID
-        sync: false
-      - key: AWS_SECRET_ACCESS_KEY
-        sync: false
